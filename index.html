@@ -255,7 +255,16 @@ body{padding-bottom:76px}
   .pile .pc.gs{margin-left:calc(20px - var(--cw))}
   .logo h1{font-size:36px}
 }
+/* ---- modo espectador (tele) ---- */
+body.spec .controls, body.spec .hand, body.spec .taxbar, body.spec .taxpill-wrap, body.spec details.log,
+body.spec .top button, body.spec #voice, body.spec [data-act="resume"], body.spec [data-act="botify"]{display:none!important}
+body.spec .status{font-size:22px}
+body.spec .seat .nm{font-size:1.15em}
+.tvbadge{position:fixed;left:12px;top:10px;z-index:50;background:rgba(0,0,0,.55);color:var(--gold);padding:4px 12px;border-radius:999px;font-size:14px;font-weight:700;pointer-events:none}
+.castbtn{background:#1a73e8!important;color:#fff!important}
 </style>
+<script>window.__onGCastApiAvailable = ok => { window.castOk = !!ok; if (ok && window.onCastReady) window.onCastReady(); };</script>
+<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js" async></script>
 </head>
 <body>
 <div class="scene" id="scene"></div>
@@ -291,6 +300,7 @@ body{padding-bottom:76px}
           <div class="ob"><input id="code" maxlength="5" placeholder="ABCDE" style="text-transform:uppercase;text-align:center;letter-spacing:4px" aria-label="Código de mesa">
             <div class="oh2" style="padding-left:0;text-align:center">Código de 5 letras</div></div>
           <button id="btnJoin">Unirme a la mesa</button>
+          <button id="btnSpec" class="sec" style="margin-top:6px">📺 Ver como espectador</button>
         </div>
       </div>
     </div>
@@ -365,6 +375,7 @@ let sel = new Set(), lastHandKey = '';
 
 /* ============ HOST: LÓGICA DEL JUEGO ============ */
 let G = null; const conns = {}; let botTimer = null;
+const specs = new Set(); const SPEC_ID = '__tele';
 
 function newGame(code, name){
   G = {code, hostId: myPid, phase:'lobby',
@@ -661,6 +672,10 @@ function sync(){
     if(p.id===G.hostId) onState(view(p.id));
     else if(!p.bot && conns[p.id] && conns[p.id].open){ try{conns[p.id].send({t:'state', s:view(p.id)});}catch(e){} }
   }
+  if(specs.size){
+    const sv = Object.assign(view(SPEC_ID), {spectator:true, canPause:false, pausesLeft:0, isHost:false});
+    for(const c of specs){ if(c.open){ try{ c.send({t:'state', s:sv}); }catch(e){} } }
+  }
   scheduleBots();
 }
 
@@ -682,6 +697,12 @@ function createHost(name, tries=0){
 }
 function onHostData(c, d){
   if(!d || !G) return;
+  if(d.t==='spectate'){   // una tele que solo mira: no ocupa lugar ni ve cartas de nadie
+    c.spec=true; specs.add(c);
+    try{ c.send({t:'av', map:AV}); }catch(e){}
+    sync(); return;
+  }
+  if(c.spec) return;
   if(d.t==='join'){
     const name=String(d.name||'Jugador').trim().slice(0,16)||'Jugador';
     let p=P(d.pid);
@@ -699,6 +720,7 @@ function onHostData(c, d){
   } else if(d.t==='act' && c.pid){ handle(c.pid, d.a); }
 }
 function onHostClose(c){
+  if(c.spec){ specs.delete(c); return; }
   if(!c.pid || conns[c.pid]!==c) return;
   delete conns[c.pid];
   const p=P(c.pid); if(!p) return;
@@ -726,7 +748,39 @@ function connectToHost(){
   hostConn.on('data', d=>{ if(d.t==='closed'){ mode=null; location.href=location.pathname+'?cerrada=1'; return; } if(d.t==='state') onState(d.s); else if(d.t==='av'){ AV=d.map||{}; if(V) rerenderAvatars(); } else if(d.t==='error') showError(d.msg); });
   hostConn.on('close', ()=>{ if(mode==='client') showDisconnected(); });
 }
+let specRetry=null;
+function spectateRoom(code){
+  code=code.trim().toUpperCase(); joinCode=code;
+  document.body.classList.add('spec');
+  if(!document.querySelector('.tvbadge')){ const b=document.createElement('div'); b.className='tvbadge'; b.textContent='📺 Espectador · mesa '+code; document.body.appendChild(b); }
+  const go=()=>{
+    const c = peer.connect(PREFIX+code, {reliable:true});
+    hostConn=c;
+    c.on('open', ()=>{ mode='spec'; history.replaceState(null,'','?sala='+code+'&tv=1'); c.send({t:'spectate'}); });
+    c.on('data', d=>{
+      if(d.t==='closed'){ mode=null; $('#game').innerHTML='<div class="panel" style="max-width:520px;margin:80px auto;text-align:center"><h2>La mesa se cerró</h2><div class="muted">Cuando armen otra, mandala de nuevo a la tele.</div></div>'; return; }
+      if(d.t==='state') onState(d.s); else if(d.t==='av'){ AV=d.map||{}; if(V) rerenderAvatars(); }
+    });
+    // una tele está sola: si se corta, reintenta sola cada 3 s
+    c.on('close', ()=>{ if(mode==='spec'){ clearTimeout(specRetry); specRetry=setTimeout(go, 3000); } });
+  };
+  if(!peer || peer.destroyed){
+    peer = new Peer();
+    peer.on('open', go);
+    peer.on('error', e=>{
+      if(e.type==='peer-unavailable'){ showSpecWait(code); clearTimeout(specRetry); specRetry=setTimeout(go, 4000); }
+      else if(e.type!=='disconnected') showError('Error de conexión ('+e.type+').');
+    });
+    peer.on('disconnected', ()=>{ try{peer.reconnect();}catch(e){} });
+  } else go();
+}
+function showSpecWait(code){
+  if(V) return;
+  $('#home').classList.add('hidden'); const g=$('#game'); g.classList.remove('hidden'); document.body.classList.add('ingame');
+  g.innerHTML=`<div class="panel" style="max-width:520px;margin:80px auto;text-align:center;display:grid;gap:10px"><h2>📺 Esperando la mesa <span class="code">${esc(code)}</span></h2><div class="muted">Me conecto solo apenas el anfitrión la abra.</div></div>`;
+}
 function act(a){
+  if(mode==='spec') return;
   if(mode==='host') handle(myPid, a);
   else if(hostConn && hostConn.open) hostConn.send({t:'act', a});
 }
@@ -843,6 +897,15 @@ function render(){
 }
 
 function renderLobby(g){
+  if(V.spectator){
+    const pl = V.seats.map(p=>`<li><span class="lpl">${avatarHTML(p,'sm')}${esc(p.name)}${p.id===V.hostId?'<span class="tag">anfitrión</span>':''}${p.bot?'<span class="tag">bot</span>':''}</span></li>`).join('');
+    g.innerHTML = `<div class="panel" style="max-width:640px;margin:40px auto;display:grid;gap:14px;text-align:center">
+      <h2>📺 Mesa <span class="code">${V.code}</span></h2>
+      <div class="muted">Modo espectador · ${V.seats.length}/8 en la mesa</div>
+      <ul class="plist" style="text-align:left">${pl}</ul>
+      <div class="note">Esperando que el anfitrión arranque la partida…</div></div>`;
+    return;
+  }
   const link = location.origin + location.pathname + '?sala=' + V.code;
   const pl = V.seats.map(p=>`<li><span class="lpl">${avatarHTML(p,'sm')}${esc(p.name)}${p.id===V.me?'<span class="tag">vos</span>':''}${p.id===V.hostId?'<span class="tag">anfitrión</span>':''}${p.bot?'<span class="tag">bot</span>':''}${p.voice?`<span class="tag" ${p.talking?'style="background:#2e7d4f"':''}>${p.talking?'🔊 habla':'🎙️ voz'}</span>`:''}</span>
     ${V.isHost && p.id!==V.hostId ? `<button class="sec" data-act="kick" data-id="${esc(p.id)}" style="padding:4px 10px">Sacar</button>`:''}</li>`).join('');
@@ -852,6 +915,7 @@ function renderLobby(g){
     <div><div class="muted" style="font-size:13px;margin-bottom:6px">Pasales este link (o el código):</div>
       <div class="row" style="flex-wrap:nowrap"><input readonly value="${esc(link)}" id="lnk"><button class="sec" data-act="copy">Copiar</button></div></div>
     <ul class="plist">${pl}</ul>
+    ${castReady?`<button class="castbtn" data-act="castTv">📺 Mandar la mesa a la tele (Chromecast)</button>`:''}
     ${V.isHost ? `
       <div style="display:grid;gap:10px">
         <label class="row" style="flex-wrap:nowrap;gap:8px;cursor:pointer"><input type="checkbox" id="optListed" style="width:auto" ${V.options.listed!==false?'checked':''}> Mesa pública <span class="muted" style="font-size:12px">(aparece en "Mesas abiertas")</span></label>
@@ -976,6 +1040,7 @@ function renderTable(g){
   g.innerHTML = `
     <div class="top"><h3 style="color:var(--gold)">Dalmuti · Mano ${V.handNum}</h3>
       <div class="row"><span class="muted">Mesa <span class="code">${V.code}</span></span>
+      ${castReady?'<button class="castbtn" data-act="castTv" style="padding:6px 10px" title="Mandar la mesa a la tele">📺</button>':''}
       ${['play','tax','revolution'].includes(V.phase)&&!V.paused?`<button class="sec" data-act="pause" style="padding:6px 10px" ${V.canPause?'':'disabled'} title="Cada jugador tiene ${MAX_PAUSES} pausas por partida">⏸ Pausa (${V.pausesLeft})</button>`:''}
       ${V.isHost?'<button class="sec" data-act="lobby" style="padding:6px 10px">Volver al lobby</button>':'<button class="sec" data-act="leaveRoom" style="padding:6px 10px">Salir</button>'}</div></div>
     <div class="table">${seats}<div class="center">${center}</div></div>
@@ -1117,6 +1182,7 @@ async function primeMic(){ // pide el permiso ya desde el inicio, así después 
   try{ const st=await navigator.mediaDevices.getUserMedia({audio:true}); st.getTracks().forEach(t=>t.stop()); }catch(e){}
 }
 function voiceNudge(p, c){
+  if(mode==='spec') return;
   if(!c || localStream) { if(localStream) clearVoiceToasts(); return; }
   const others = (c.voicePeers||[]).filter(v=>v.id!==c.me);
   const nameOf = id => ((c.seats||[]).find(x=>x.id===id)||{}).name || 'Alguien';
@@ -1144,6 +1210,7 @@ function closeRoom(){
   const humans=G.players.filter(p=>!p.bot && p.id!==G.hostId && p.connected).length;
   if(humans && !confirm(`¿Cerrar la mesa? Se va a sacar a ${humans===1?'1 jugador':humans+' jugadores'}.`)) return;
   for(const id in conns){ try{ conns[id].send({t:'closed'}); }catch(e){} }
+  for(const c of specs){ try{ c.send({t:'closed'}); }catch(e){} }
   if(reg.lastHB){ regSend({t:'bye', code:reg.lastHB}); reg.lastHB=null; }
   if(localStream){ try{ voiceOff(); }catch(e){} }
   clearTimeout(botTimer); clearTimeout(tTimer);
@@ -1167,6 +1234,7 @@ function sendAvatars(){
   if(mode!=='host' || !G) return;
   AV=buildAV();
   for(const p of G.players){ if(!p.bot && p.id!==G.hostId && conns[p.id] && conns[p.id].open){ try{conns[p.id].send({t:'av', map:AV});}catch(e){} } }
+  for(const c of specs){ if(c.open){ try{ c.send({t:'av', map:AV}); }catch(e){} } }
   rerenderAvatars();
 }
 function rerenderAvatars(){
@@ -1392,6 +1460,8 @@ document.addEventListener('click', e=>{
   }
   const b=e.target.closest('[data-act]'); if(!b) return;
   const a=b.dataset.act;
+  if(a==='castTv'){ castTv(); return; }
+  if(mode==='spec' && !['sndToggle','sndMute','avView'].includes(a)) return;
   if(a==='copy'){ const l=$('#lnk'); l.select(); try{navigator.clipboard.writeText(l.value);}catch(err){document.execCommand('copy');} b.textContent='¡Copiado!'; return; }
   if(a==='sndToggle'){ $('#sndPop').classList.toggle('hidden'); return; }
   if(a==='sndMute'){ SND.muted=!SND.muted; saveSnd(); if(!SND.muted) sfx('turn'); return; }
@@ -1488,7 +1558,7 @@ function voiceSync(){
 }
 function renderVoice(){
   const box=$('#voice');
-  if(!mode || !V){ box.style.display='none'; return; }
+  if(!mode || !V || mode==='spec'){ box.style.display='none'; return; }
   box.style.display='flex';
   if(!localStream){
     const on=(V.voicePeers||[]).filter(v=>v.id!==V.me).length;
@@ -1639,6 +1709,51 @@ function renderLobbies(){
 // avisar baja al cerrar la pestaña
 window.addEventListener('pagehide', ()=>{ if(reg.lastHB) regSend({t:'bye', code:reg.lastHB}); });
 
+/* ============ TELE: Chromecast viejo vía DashCast (app pública y gratis que abre una URL) ============ */
+const CAST_APPS = [
+  { id:'5C3F0A3C', ns:'urn:x-cast:es.offd.dashcast', n:'DashCast' },
+  { id:'84912283', ns:'urn:x-cast:com.madmod.dashcast', n:'DashCast (alternativa)' },
+];
+let castReady=false, castTry = +(sget(localStorage,'dlm_castapp')||0) % CAST_APPS.length, castSession=null;
+function initCast(){
+  if(castReady || !window.chrome || !chrome.cast || !chrome.cast.SessionRequest) return;
+  const cfg = new chrome.cast.ApiConfig(new chrome.cast.SessionRequest(CAST_APPS[castTry].id), ()=>{}, ()=>{}, chrome.cast.AutoJoinPolicy.PAGE_SCOPED);
+  chrome.cast.initialize(cfg, ()=>{ castReady=true; if(V && mode!=='spec') render(); }, e=>console.log('[cast] init', e));
+}
+window.onCastReady = initCast; if(window.castOk) initCast();
+let castToast=null;
+function castSay(html, ms){ if(castToast) castToast.remove(); castToast=toast(`<span class="ti">📺</span><div class="tm">${html}</div>`, ms||0); console.log('[cast]', html); }
+const waitMs = ms => new Promise(r=>setTimeout(r, ms));
+function castTv(){
+  if(!V || !V.code) return;
+  if(location.protocol!=='https:'){ castSay('La página tiene que estar en https (GitHub Pages) para mandarla a la tele.', 6000); return; }
+  const app=CAST_APPS[castTry];
+  const url = location.origin + location.pathname + '?sala=' + V.code + '&tv=1';
+  if(castSession){ try{ castSession.stop(()=>{},()=>{}); }catch(e){} castSession=null; }
+  // requestSession tiene que salir directo del toque (si no, Chrome no abre el selector)
+  chrome.cast.requestSession(s=>{ castSession=s; castSend(s, app, url); },
+    e=>{ if(!(e && e.code==='cancel')) castSay('No se pudo conectar al Chromecast ('+((e&&e.code)||e)+').', 6000); },
+    new chrome.cast.SessionRequest(app.id));
+}
+async function castSend(s, app, url){
+  let acked=false; const onEcho=()=>{ acked=true; };
+  try{ s.addMessageListener(app.ns, onEcho); }catch(e){}
+  const msg={ url, force:true, reload:false, reload_time:0 };
+  for(let i=1;i<=4 && !acked;i++){
+    castSay(`Mandando la mesa a la tele (intento ${i})…`);
+    await waitMs(i===1?1200:1800);
+    s.sendMessage(app.ns, msg, ()=>{}, e=>console.log('[cast] send', e));
+    await waitMs(1200);
+  }
+  try{ s.removeMessageListener(app.ns, onEcho); }catch(e){}
+  if(acked){ sset(localStorage,'dlm_castapp', String(castTry)); castSay('Listo: la mesa se abre en la tele como espectador.', 5000); }
+  else {
+    castTry=(castTry+1)%CAST_APPS.length;
+    try{ s.stop(()=>{},()=>{}); }catch(e){} castSession=null;
+    castSay(`${app.n} no respondió. Tocá 📺 otra vez: pruebo con ${CAST_APPS[castTry].n}.`, 9000);
+  }
+}
+
 /* ---- home ---- */
 updateHomeAv(); applySnd();
 try{ regStart(); }catch(e){ console.warn('lista de mesas no disponible', e); }
@@ -1650,6 +1765,8 @@ try{ regStart(); }catch(e){ console.warn('lista de mesas no disponible', e); }
   $('#homePublic').addEventListener('change', e=>sset(localStorage,'dlm_public', e.target.checked?'1':'0'));
   if(new URLSearchParams(location.search).get('cerrada')){ const e=$('#homeErr'); e.textContent='El anfitrión cerró la mesa.'; e.classList.remove('hidden'); history.replaceState(null,'',location.pathname); }
   const q=new URLSearchParams(location.search).get('sala'); if(q) $('#code').value=q.toUpperCase();
+  if(q && new URLSearchParams(location.search).get('tv')){ if(typeof Peer==='undefined') showError('No cargó la librería de conexión.'); else spectateRoom(q); }
+  $('#btnSpec').onclick=()=>{ const c=$('#code').value.trim(); if(c.length<5) return showError('Poné el código de 5 letras de la mesa que querés ver.'); if(typeof Peer==='undefined') return showError('No cargó la librería de conexión.'); $('#btnSpec').disabled=true; spectateRoom(c); };
   function getName(){ const n=$('#name').value.trim(); if(!n){ showError('Poné tu nombre primero.'); $('#name').focus(); return null; } sset(localStorage,'dlm_name',n); $('#homeErr').classList.add('hidden'); return n; }
   $('#btnCreate').onclick=()=>{ const n=getName(); if(!n) return; if(typeof Peer==='undefined') return showError('No cargó la librería de conexión. Revisá internet.'); $('#btnCreate').disabled=true; $('#btnCreate').textContent='Creando…'; createHost(n); };
   $('#btnJoin').onclick=()=>{ const n=getName(); if(!n) return; const c=$('#code').value.trim(); if(c.length<5) return showError('El código tiene 5 letras.'); if(typeof Peer==='undefined') return showError('No cargó la librería de conexión.'); $('#btnJoin').disabled=true; $('#btnJoin').textContent='Conectando…'; joinRoom(c,n); setTimeout(()=>{ $('#btnJoin').disabled=false; $('#btnJoin').textContent='Unirme a la mesa'; },6000); };
